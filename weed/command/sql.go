@@ -22,19 +22,20 @@ func init() {
 }
 
 var cmdSql = &Command{
-	UsageLine: "sql [-master=localhost:9333] [-interactive] [-file=query.sql] [-output=table|json|csv] [-database=dbname] [-query=\"SQL\"]",
+	UsageLine: "sql [-master=localhost:9333] [-interactive] [-file=query.sql] [-output=table|json|csv] [-database=dbname] [-query=\"SQL\"] [-nl=\"natural language question\"]",
 	Short:     "advanced SQL query interface for SeaweedFS MQ topics with multiple execution modes",
 	Long: `Enhanced SQL interface for SeaweedFS Message Queue topics with multiple execution modes.
 
 Execution Modes:
 - Interactive shell (default): weed sql -interactive
-- Single query: weed sql -query "SELECT * FROM user_events"  
+- Single query: weed sql -query "SELECT * FROM user_events"
+- Natural-language query: weed sql -nl "how many events happened today?" -database mydb
 - Batch from file: weed sql -file queries.sql
 - Context switching: weed sql -database analytics -interactive
 
 Output Formats:
 - table: ASCII table format (default for interactive)
-- json: JSON format (default for non-interactive) 
+- json: JSON format (default for non-interactive)
 - csv: Comma-separated values
 
 Features:
@@ -43,12 +44,16 @@ Features:
 - Multi-value filtering with IN operator
 - Real MQ namespace and topic discovery
 - Database context switching
+- Text-to-SQL via Claude Fable 5 (requires ANTHROPIC_API_KEY)
+  Interactive: \ask <natural language question>
+  One-shot:    -nl "natural language question"
 
 Examples:
   weed sql -interactive
   weed sql -query "SHOW DATABASES" -output json
   weed sql -file batch_queries.sql -output csv
   weed sql -database analytics -query "SELECT COUNT(*) FROM metrics"
+  weed sql -database analytics -nl "show me the top 5 users by event count"
   weed sql -master broker1:9333 -interactive
 `,
 }
@@ -60,6 +65,7 @@ var (
 	sqlOutput      = cmdSql.Flag.String("output", "", "output format: table, json, csv (auto-detected if not specified)")
 	sqlDatabase    = cmdSql.Flag.String("database", "", "default database context")
 	sqlQuery       = cmdSql.Flag.String("query", "", "execute single SQL query")
+	sqlNL          = cmdSql.Flag.String("nl", "", "translate natural language question to SQL using Claude Fable 5 and execute it (requires ANTHROPIC_API_KEY)")
 )
 
 // OutputFormat represents different output formatting options
@@ -102,6 +108,9 @@ func runSql(command *Command, args []string) bool {
 
 	// Execute based on mode
 	switch {
+	case *sqlNL != "":
+		// Natural-language one-shot mode
+		return executeNLQuery(ctx, *sqlNL)
 	case *sqlQuery != "":
 		// Single query mode
 		return executeSingleQuery(ctx, *sqlQuery)
@@ -141,6 +150,34 @@ func executeSingleQuery(ctx *SQLContext, query string) bool {
 
 	fmt.Printf("Executing query against %s...\n", *sqlMaster)
 	return executeAndDisplay(ctx, query, true)
+}
+
+// executeNLQuery translates a natural-language question to SQL via Claude Fable 5 and runs it.
+func executeNLQuery(ctx *SQLContext, question string) bool {
+	db := ctx.currentDatabase
+	if db == "" {
+		fmt.Println("Error: -database must be set when using -nl")
+		return false
+	}
+
+	t2s := engine.NewTextToSQL()
+	schemaCtx, err := engine.BuildSchemaContext(ctx.engine.GetCatalog(), db)
+	if err != nil {
+		fmt.Printf("Error building schema context: %v\n", err)
+		return false
+	}
+
+	apiCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	sql, err := t2s.GenerateSQL(apiCtx, question, schemaCtx)
+	if err != nil {
+		fmt.Printf("Error generating SQL: %v\n", err)
+		return false
+	}
+
+	fmt.Printf("Generated SQL: %s\n\n", sql)
+	return executeAndDisplay(ctx, sql, ctx.outputFormat == OutputTable)
 }
 
 // executeFileQueries processes SQL queries from a file
@@ -305,6 +342,42 @@ func runInteractiveShell(ctx *SQLContext) bool {
 			continue
 		}
 
+		// Handle \ask <question> — NL→SQL via Claude Fable 5
+		if strings.HasPrefix(strings.ToLower(cleanQuery), "\\ask ") {
+			question := strings.TrimSpace(cleanQuery[5:])
+			if question == "" {
+				fmt.Println("Usage: \\ask <natural language question>")
+				queryBuffer.Reset()
+				continue
+			}
+			db := ctx.currentDatabase
+			if db == "" {
+				fmt.Println("Error: no database selected. Run USE <database> first.")
+				queryBuffer.Reset()
+				continue
+			}
+			t2s := engine.NewTextToSQL()
+			schemaCtx, err := engine.BuildSchemaContext(ctx.engine.GetCatalog(), db)
+			if err != nil {
+				fmt.Printf("Error building schema context: %v\n", err)
+				queryBuffer.Reset()
+				continue
+			}
+			apiCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			generatedSQL, err := t2s.GenerateSQL(apiCtx, question, schemaCtx)
+			cancel()
+			if err != nil {
+				fmt.Printf("Error generating SQL: %v\n", err)
+				queryBuffer.Reset()
+				continue
+			}
+			fmt.Printf("Generated SQL: %s\n\n", generatedSQL)
+			line.AppendHistory(generatedSQL)
+			executeAndDisplay(ctx, generatedSQL, true)
+			queryBuffer.Reset()
+			continue
+		}
+
 		// Handle output format switching
 		if strings.HasPrefix(strings.ToUpper(cleanQuery), "\\FORMAT ") {
 			format := strings.TrimSpace(strings.TrimPrefix(strings.ToUpper(cleanQuery), "\\FORMAT "))
@@ -357,7 +430,8 @@ func isSpecialCommand(query string) bool {
 		return false
 	}
 	return (parts[0] == "USE" && len(parts) >= 2) ||
-		strings.HasPrefix(strings.ToUpper(cleanQuery), "\\FORMAT ")
+		strings.HasPrefix(strings.ToUpper(cleanQuery), "\\FORMAT ") ||
+		strings.HasPrefix(strings.ToLower(cleanQuery), "\\ask ")
 }
 
 // executeAndDisplay executes a query and displays the result in the specified format
@@ -574,10 +648,12 @@ DDL OPERATIONS:
   Note: ALTER TABLE and DROP TABLE are not supported
 
 SPECIAL COMMANDS:
-  USE database_name;           - Switch database context
-  \format table|json|csv       - Change output format
-  help;                        - Show this help
-  exit; or quit; or \q        - Exit interface
+  USE database_name;                     - Switch database context
+  \ask <question>                        - Translate NL to SQL via Claude Fable 5 and execute
+                                           (requires ANTHROPIC_API_KEY and active database)
+  \format table|json|csv                 - Change output format
+  help;                                  - Show this help
+  exit; or quit; or \q                   - Exit interface
 
 EXTENDED WHERE OPERATORS:
   =, <, >, <=, >=             - Comparison operators
